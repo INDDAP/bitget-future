@@ -9,6 +9,7 @@ A live trading bot for BTCUSDT Perpetual Futures on Bitget.
 - Places orders via CCXT (Bitget futures)
 - Saves state to disk for persistence
 - Exposes a dummy HTTP port (8000) for health‐checks
+- Prints a notification each time entry conditions are checked and skipped
 """
 
 import os
@@ -88,7 +89,13 @@ data_lock = threading.Lock()
 # ─── 3) HTTP HEALTH‐CHECK SERVER ────────────────────────────────────────────────
 
 class HealthHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        # Respond 200 to any HEAD request
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self):
+        # Respond 200 + “OK” to any GET request
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
@@ -96,7 +103,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     """
-    Starts a minimal HTTP server on HEALTH_PORT that responds "OK" to any GET.
+    Starts a minimal HTTP server on HEALTH_PORT that responds "OK" to every HEAD or GET.
     """
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
     print(f"Health-check server listening on port {HEALTH_PORT}")
@@ -135,7 +142,6 @@ def fetch_daily_cache():
     """
     global df1d
     exchange = get_ccxt_exchange()
-    # Fetch last 365 daily bars
     since = exchange.parse8601(
         (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
     )
@@ -280,6 +286,7 @@ def calculate_indicators():
 def calculate_entry_exit(ind):
     """
     Given the latest indicators (dict), decide entry or exit.
+    Prints a notification if entry conditions are checked and skipped.
     """
     global bot_state
     ts       = ind["timestamp"]
@@ -350,14 +357,17 @@ def calculate_entry_exit(ind):
 
     # ── ENTRY LOGIC ───────────────────────────────────────────────────────────────
     if not bot_state["in_position"]:
-        cond1 = (ema9 > ema21 > ema50)
-        cond2 = (adx > 20) and (rsi > 55)
-        cond3 = (price > ema50_15)
-        cond4 = (price > vwap)
-        cond5 = (price > pivot)
-        cond6 = bull
+        # Evaluate each condition
+        cond1 = (ema9 > ema21 > ema50)           # EMA stacking on 5m
+        cond2 = (adx > 20) and (rsi > 55)        # ADX + RSI momentum
+        cond3 = (price > ema50_15)               # 15m EMA50 confirmation
+        cond4 = (price > vwap)                   # VWAP filter
+        cond5 = (price > pivot)                  # Daily pivot filter
+        cond6 = bull                            # Bullish Engulfing pattern
+        # All six must be true to enter
+        all_ok = all([cond1, cond2, cond3, cond4, cond5, cond6, atr > 0])
 
-        if all([cond1, cond2, cond3, cond4, cond5, cond6, atr > 0]):
+        if all_ok:
             entry_price = price
             take_profit = entry_price + ATR_MULTIPLIER * atr
             equity      = bot_state["equity"]
@@ -379,6 +389,15 @@ def calculate_entry_exit(ind):
                 "entry_time":    ts.isoformat()
             })
             save_state()
+            return
+        else:
+            # Print a notification showing which conditions failed
+            tstr = ts.isoformat()
+            print(
+                f"[{tstr}] ❌ Entry conditions not met: "
+                f"cond1={cond1}, cond2={cond2}, cond3={cond3}, "
+                f"cond4={cond4}, cond5={cond5}, cond6={cond6} → skipping entry."
+            )
             return
 
 async def periodic_daily_refresh():
