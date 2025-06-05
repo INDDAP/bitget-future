@@ -23,7 +23,7 @@ import numpy as np
 import ccxt
 import websocket  # pip install websocket-client
 
-# 1) CONFIGURATION
+# ─── 1) CONFIGURATION ──────────────────────────────────────────────────────────
 
 API_KEY    = os.getenv("BITGET_API_KEY")
 API_SECRET = os.getenv("BITGET_API_SECRET")
@@ -32,24 +32,23 @@ PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")  # Bitget requires passphrase
 if not all([API_KEY, API_SECRET, PASSPHRASE]):
     raise ValueError("Please set BITGET_API_KEY, BITGET_API_SECRET, and BITGET_API_PASSPHRASE")
 
-SYMBOL          = "BTCUSDT"            # symbol for CCXT (futures)
-MARKET          = "UMCBL"              # perpetual futures market suffix on Bitget
-FULL_SYMBOL     = f"{SYMBOL}_{MARKET}" # "BTCUSDT_UMCBL"
-TIMEFRAME_5M    = "5m"
-TIMEFRAME_15M   = "15m"
-TIMEFRAME_1D    = "1d"
-STATE_FILE      = "bot_state.json"
-DATA_DIR        = "data_cache"         # directory to store cached CSVs
-TARGET_LEVERAGE = 100                  # leverage
-START_EQUITY    = 1000.0               # initial equity (theoretical)
-MAX_BARS_HELD   = 10                   # exit at breakeven after 10 bars
-ATR_MULTIPLIER  = 0.5                  # TP = entry_price + ATR*0.5
-REFRESH_1D_HRS  = 1                    # hourly refresh of 1d cache
+WS_SYMBOL      = "BTCUSDT_UMCBL"  # for WebSocket subscription (Bitget format)
+CCXT_SYMBOL    = "BTCUSDT"        # for CCXT REST calls (Bitget futures)
+TIMEFRAME_5M   = "5m"
+TIMEFRAME_15M  = "15m"
+TIMEFRAME_1D   = "1d"
+STATE_FILE     = "bot_state.json"
+DATA_DIR       = "data_cache"     # directory to store cached CSVs
+TARGET_LEVERAGE = 100             # leverage
+START_EQUITY   = 1000.0           # initial equity (theoretical)
+MAX_BARS_HELD  = 10               # exit at breakeven after 10 bars
+ATR_MULTIPLIER = 0.5              # TP = entry_price + ATR*0.5
+REFRESH_1D_HRS = 1                # hourly refresh of 1d cache
 
 # WebSocket endpoint for Bitget mix (USDT-m futures)
 WS_URL = "wss://ws.bitgetapi.com/mix/v1/stream"
 
-# 2) GLOBAL STATE
+# ─── 2) GLOBAL STATE ────────────────────────────────────────────────────────────
 
 if os.path.exists(STATE_FILE):
     with open(STATE_FILE, "r") as f:
@@ -72,7 +71,7 @@ df1d  = pd.DataFrame()  # daily cached
 
 data_lock = threading.Lock()
 
-# 3) UTILITY FUNCTIONS
+# ─── 3) UTILITY FUNCTIONS ───────────────────────────────────────────────────────
 
 def save_state():
     with open(STATE_FILE, "w") as f:
@@ -101,14 +100,15 @@ def fetch_daily_cache():
     """
     global df1d
     exchange = get_ccxt_exchange()
+    # Fetch past 365 days of 1d data
     since = exchange.parse8601((datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    ohlcv = exchange.fetch_ohlcv(FULL_SYMBOL, timeframe=TIMEFRAME_1D, since=since, limit=365)
+    ohlcv = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_1D, since=since, limit=365)
     df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
+    # Compute prior-day pivot = (H_prev + L_prev + C_prev)/3
     df["pivot"] = (df["high"].shift(1) + df["low"].shift(1) + df["close"].shift(1)) / 3
     df1d = df[["open","high","low","close","volume","pivot"]]
-    # Save to CSV for inspection
     os.makedirs(DATA_DIR, exist_ok=True)
     df1d.to_csv(f"{DATA_DIR}/BTCUSDT_1d_cache.csv")
 
@@ -146,23 +146,27 @@ def calculate_indicators():
     if len(df5) < 50 or len(df15) < 50 or len(df1) < 2:
         return None
 
-    # 5m EMAs
+    # === 5m EMAs ===
     df5["ema9"]  = df5["close"].ewm(span=9, adjust=False).mean()
     df5["ema21"] = df5["close"].ewm(span=21,adjust=False).mean()
     df5["ema50"] = df5["close"].ewm(span=50,adjust=False).mean()
-    # RSI14
+
+    # === RSI(14) ===
     delta = df5["close"].diff()
     gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss  = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     rs    = gain / loss
     df5["rsi"]  = 100 - (100 / (1 + rs))
-    # ADX14
+
+    # === ADX(14) ===
     high = df5["high"]
     low  = df5["low"]
     prev_close = df5["close"].shift(1)
-    tr   = pd.concat([high - low,
-                      (high - prev_close).abs(),
-                      (low - prev_close).abs()], axis=1).max(axis=1)
+    tr   = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
     tr14 = tr.ewm(alpha=1/14, adjust=False).mean()
     up_move   = high.diff()
     down_move = low.shift(1) - low
@@ -174,9 +178,11 @@ def calculate_indicators():
     minus_di  = 100 * (minus_dm14 / tr14)
     dx        = 100 * ( (plus_di - minus_di).abs() / (plus_di + minus_di) )
     df5["adx"]= dx.ewm(alpha=1/14, adjust=False).mean()
-    # ATR14
+
+    # === ATR(14) ===
     df5["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
-    # VWAP (intraday)
+
+    # === VWAP ===
     df5["date"] = df5["timestamp"].dt.floor("D")
     vwap_vals = []
     for d, grp in df5.groupby("date"):
@@ -185,18 +191,21 @@ def calculate_indicators():
         cum_vol = grp["volume"].cumsum()
         vwap_vals += list((cum_vp / cum_vol).fillna(method="ffill"))
     df5["vwap"] = vwap_vals
-    # Bullish Engulfing
+
+    # === Bullish Engulfing ===
     op_prev   = df5["open"].shift(1)
     cl_prev   = df5["close"].shift(1)
     df5["bull_engulf"] = (op_prev > cl_prev) & (df5["open"] < cl_prev) & (df5["close"] > op_prev)
 
     latest = df5.iloc[-1]
     ts_latest = latest["timestamp"]
-    # 15m EMA50 for timestamp
+
+    # 15m EMA50 (forward-filled)
     df15_idx = df15[df15["timestamp"] <= ts_latest]
     if df15_idx.empty:
         return None
     ema50_15_val = df15_idx.iloc[-1]["ema50_15"]
+
     # Daily pivot
     pivot_val = df1.loc[df1.index.date == ts_latest.date(), "pivot"].values
     if len(pivot_val) == 0:
@@ -204,7 +213,7 @@ def calculate_indicators():
     else:
         pivot_val = float(pivot_val[0])
 
-    indicators = {
+    return {
         "timestamp":    ts_latest,
         "close":        float(latest["close"]),
         "high":         float(latest["high"]),
@@ -219,7 +228,6 @@ def calculate_indicators():
         "ema50_15":     float(ema50_15_val),
         "pivot":        float(pivot_val) if not np.isnan(pivot_val) else np.nan
     }
-    return indicators
 
 def calculate_entry_exit(ind):
     """
@@ -242,7 +250,7 @@ def calculate_entry_exit(ind):
 
     exchange = get_ccxt_exchange()
 
-    # EXIT LOGIC
+    # ── EXIT LOGIC ───────────────────────────────────────────────────────────────
     if bot_state["in_position"]:
         bot_state["bars_held"] += 1
         ep     = bot_state["entry_price"]
@@ -250,8 +258,9 @@ def calculate_entry_exit(ind):
         qty    = bot_state["quantity"]
         equity = bot_state["equity"]
 
+        # Check TP
         if high >= tp:
-            exchange.create_order(FULL_SYMBOL, "market", "sell", qty)
+            exchange.create_order(CCXT_SYMBOL, "market", "sell", qty)
             R       = (tp - ep) / ep
             pnl     = equity * (TARGET_LEVERAGE * R)
             bot_state["equity"] = equity + pnl
@@ -268,15 +277,16 @@ def calculate_entry_exit(ind):
             save_state()
             return
 
+        # Breakeven after MAX_BARS_HELD
         if bot_state["bars_held"] >= MAX_BARS_HELD:
             order = exchange.create_order(
-                FULL_SYMBOL, "limit", "sell", qty, ep, {"timeInForce": "GTC"}
+                CCXT_SYMBOL, "limit", "sell", qty, ep, {"timeInForce": "GTC"}
             )
             time.sleep(2)
-            status = exchange.fetch_order(order["id"], FULL_SYMBOL)
+            status = exchange.fetch_order(order["id"], CCXT_SYMBOL)
             if status["status"] != "closed":
-                exchange.cancel_order(order["id"], FULL_SYMBOL)
-                exchange.create_order(FULL_SYMBOL, "market", "sell", qty)
+                exchange.cancel_order(order["id"], CCXT_SYMBOL)
+                exchange.create_order(CCXT_SYMBOL, "market", "sell", qty)
             print(f"[{ts}] ▶ Breakeven exit. Sold {qty:.6f} BTC @ {ep:.2f}. P/L = 0.")
             bot_state.update({
                 "in_position":   False,
@@ -290,7 +300,7 @@ def calculate_entry_exit(ind):
             save_state()
             return
 
-    # ENTRY LOGIC
+    # ── ENTRY LOGIC ───────────────────────────────────────────────────────────────
     if not bot_state["in_position"]:
         cond1 = (ema9 > ema21 > ema50)
         cond2 = (adx > 20) and (rsi > 55)
@@ -304,12 +314,12 @@ def calculate_entry_exit(ind):
             take_profit = entry_price + ATR_MULTIPLIER * atr
             equity      = bot_state["equity"]
             raw_qty     = (equity * TARGET_LEVERAGE) / entry_price
-            step_size   = exchange.markets[FULL_SYMBOL]["limits"]["cost"]["min"]
+            step_size   = exchange.markets[CCXT_SYMBOL]["limits"]["cost"]["min"]
             qty         = math.floor(raw_qty / step_size) * step_size
             if qty <= 0:
                 print(f"[{ts}] ⚠ Qty ≤ 0 (equity={equity:.2f}), skipping entry.")
                 return
-            exchange.create_order(FULL_SYMBOL, "market", "buy", qty)
+            exchange.create_order(CCXT_SYMBOL, "market", "buy", qty)
             print(f"[{ts}] ▶ Enter LONG. Bought {qty:.6f} BTC @ {entry_price:.2f}. TP={take_profit:.2f}")
             bot_state.update({
                 "in_position":   True,
@@ -371,7 +381,7 @@ def on_open(ws):
         "args": [
             {
                 "channel": "candle5m",
-                "instId": FULL_SYMBOL
+                "instId": WS_SYMBOL
             }
         ]
     }
