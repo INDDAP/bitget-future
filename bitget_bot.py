@@ -2,18 +2,21 @@
 bitget_bot.py
 
 A live trading bot for BTCUSDT Perpetual Futures on Bitget.
+
+Features:
 - Fetches initial 5m, 15m, and 1d candle history via REST to seed data.
-- Receives live 5-minute candles via WebSocket.
+- Receives live 5-minute candles via WebSocket (with ping/pong to keep alive).
+- Automatic WebSocket reconnect if the connection drops.
 - Resamples 5-minute candles to 15-minute and computes EMA50.
 - Caches 1-day candles (refreshed hourly) for daily pivot.
-- Implements the “zero-loss, 0.5×ATR” strategy with multi-timeframe confirmation.
+- Implements the “zero-loss, 0.5×ATR” strategy with multi-timeframe confluence.
 - Prints debug notifications when entry conditions are checked and skipped.
-- Places orders via CCXT (Bitget futures).
-- Attempts to locate any USDT balance (spot or futures) and prints raw CCXT response.
-- Saves state to disk for persistence.
-- Exposes a dummy HTTP port (8000) for health‐checks.
-- Prints a heartbeat every 5 minutes.
-- Automatically reconnects if WebSocket is lost.
+- Places market orders via CCXT (Bitget futures).
+- Attempts to detect your actual USDT balance (spot or futures) and prints the raw CCXT response for inspection.
+- If no free USDT is found, falls back to a theoretical starting equity (START_EQUITY) so trades can still run.
+- Saves bot_state (equity, open position, etc.) to disk for persistence.
+- Exposes a dummy HTTP port (8000) for Render health‐checks.
+- Prints a heartbeat every 5 minutes to show the bot is alive.
 """
 
 import os
@@ -35,35 +38,44 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 API_KEY     = os.getenv("BITGET_API_KEY")
 API_SECRET  = os.getenv("BITGET_API_SECRET")
-PASSPHRASE  = os.getenv("BITGET_PASSPHRASE")  # Bitget requires a passphrase
+PASSPHRASE  = os.getenv("BITGET_PASSPHRASE")  # Bitget requires passphrase
 
 if not all([API_KEY, API_SECRET, PASSPHRASE]):
     raise ValueError("Please set BITGET_API_KEY, BITGET_API_SECRET, and BITGET_PASSPHRASE")
 
-WS_SYMBOL    = "BTCUSDT_UMCBL"  # for WebSocket subscription (Bitget format)
-CCXT_SYMBOL  = "BTCUSDT"        # for CCXT REST calls (USDT-m perpetual futures)
+# WebSocket symbol (Bitget “mix” format) vs CCXT futures symbol
+WS_SYMBOL    = "BTCUSDT_UMCBL"
+CCXT_SYMBOL  = "BTCUSDT"
 
+# Timeframes
 TIMEFRAME_5M    = "5m"
 TIMEFRAME_15M   = "15m"
 TIMEFRAME_1D    = "1d"
 
+# Local state and cache
 STATE_FILE      = "bot_state.json"
 DATA_DIR        = "data_cache"
 
+# Strategy parameters
 TARGET_LEVERAGE = 100            # 100× leverage
-START_EQUITY    = 1000.0         # starting equity for theoretical compounding
-MAX_BARS_HELD   = 10             # exit breakeven after 10 bars
-ATR_MULTIPLIER  = 0.5            # TP = entry_price + 0.5 × ATR_at_entry
+START_EQUITY    = 1000.0         # fallback theoretical equity if no real USDT found
+MAX_BARS_HELD   = 10             # breakeven after 10 bars if TP not hit
+ATR_MULTIPLIER  = 0.5            # TP = entry_price + 0.5×ATR
 REFRESH_1D_HRS  = 1              # refresh 1d cache every 1 hour
 
+# Bitget WebSocket endpoint (USDT-margined mix)
 WS_URL = "wss://ws.bitgetapi.com/mix/v1/stream"
+
+# Health‐check port (Render expects a listening port)
 HEALTH_PORT = 8000
 
+# How often to print a heartbeat
 HEARTBEAT_INTERVAL_SECONDS = 300  # 5 minutes
 
 
 # ─── 2) GLOBAL STATE ────────────────────────────────────────────────────────────
 
+# Load or initialize bot_state
 if os.path.exists(STATE_FILE):
     with open(STATE_FILE, "r") as f:
         bot_state = json.load(f)
@@ -79,11 +91,12 @@ else:
         "entry_time": None
     }
 
-# Empty DataFrames to be populated later:
+# These DataFrames will hold incoming candle data:
 df5m  = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 df15m = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "ema50_15"])
-df1d  = pd.DataFrame()  # daily candles with pivot
+df1d  = pd.DataFrame()  # will hold 1d OHLC + pivot
 
+# Lock to protect concurrent updates from the WebSocket thread
 data_lock = threading.Lock()
 
 
@@ -101,6 +114,10 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
 def start_health_server():
+    """
+    Start a minimal HTTP server that listens on HEALTH_PORT and responds “OK” to HEAD/GET.
+    This satisfies Render’s requirement for a listening port.
+    """
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
     print(f"[{datetime.utcnow().isoformat()}] Health-check server listening on port {HEALTH_PORT}", flush=True)
     server.serve_forever()
@@ -110,7 +127,7 @@ def start_health_server():
 
 def save_state():
     """
-    Persist bot_state to disk whenever it changes.
+    Persist bot_state to disk whenever something significant changes.
     """
     with open(STATE_FILE, "w") as f:
         json.dump(bot_state, f, indent=2)
@@ -118,7 +135,7 @@ def save_state():
 
 def get_ccxt_exchange():
     """
-    Returns a CCXT instance configured for Bitget futures (USDT-m).
+    Create and return a CCXT bitget instance configured for USDT-margined futures.
     """
     exchange = ccxt.bitget({
         "apiKey": API_KEY,
@@ -126,68 +143,79 @@ def get_ccxt_exchange():
         "password": PASSPHRASE,
         "enableRateLimit": True,
         "options": {
-            "defaultType": "future",   # ensure we're in futures mode
-            "defaultSubType": "UMCBL"  # USDT-margined perpetual
+            "defaultType": "future",
+            "defaultSubType": "UMCBL"  # USDT-margined mix
         }
     })
     return exchange
 
 def print_initial_balance():
     """
-    Attempts to fetch both spot and futures balances via CCXT,
-    prints the raw CCXT 'info' for inspection, then finds any non-zero USDT.
+    Attempt to fetch both spot and futures balances via CCXT.
+    - Prints the raw 'info' response so the user can inspect exactly where their 10 USDT lives.
+    - If we detect a nonzero “free” USDT, set bot_state['equity'] to that value.
+    - Otherwise, fall back to START_EQUITY so the bot can still size trades.
     """
     try:
         exchange = get_ccxt_exchange()
-        # 1) Try fetch_balance() without params
-        bal = exchange.fetch_balance()
-        print(f"[{datetime.utcnow().isoformat()}] Raw CCXT fetch_balance() response (in 'info' field):", flush=True)
-        print(json.dumps(bal.get("info", {}), indent=2), flush=True)
+
+        # 1) Try unified fetch_balance() without params
+        bal_spot = exchange.fetch_balance()
+        info_spot = bal_spot.get("info", {})
+        print(f"[{datetime.utcnow().isoformat()}] Raw CCXT fetch_balance() response (spot) → info:", flush=True)
+        print(json.dumps(info_spot, indent=2), flush=True)
 
         usdt_free = None
-
-        # If CCXT returned a "USDT" key in the unified balance, read that:
-        if "USDT" in bal:
-            # Some versions of CCXT use 'free' under the unified structure:
-            free_val = bal["USDT"].get("free", None)
+        if "USDT" in bal_spot and isinstance(bal_spot["USDT"], dict):
+            free_val = bal_spot["USDT"].get("free", None)
             if free_val is not None:
                 usdt_free = float(free_val)
 
-        # 2) If still none or zero, try fetch_balance({"type": "future"})
-        if usdt_free is None or usdt_free == 0.0:
-            bal2 = exchange.fetch_balance(params={"type": "future"})
-            print(f"[{datetime.utcnow().isoformat()}] Raw CCXT fetch_balance({'future'}) response 'info':", flush=True)
-            print(json.dumps(bal2.get("info", {}), indent=2), flush=True)
+        # 2) Try fetching as futures wallet
+        if not usdt_free or usdt_free == 0.0:
+            bal_fut = exchange.fetch_balance(params={"type": "future"})
+            info_fut = bal_fut.get("info", {})
+            print(f"[{datetime.utcnow().isoformat()}] Raw CCXT fetch_balance({'future'}) response → info:", flush=True)
+            print(json.dumps(info_fut, indent=2), flush=True)
 
-            if "USDT" in bal2:
-                free_val2 = bal2["USDT"].get("free", None)
+            if "USDT" in bal_fut and isinstance(bal_fut["USDT"], dict):
+                free_val2 = bal_fut["USDT"].get("free", None)
                 if free_val2 is not None:
                     usdt_free = float(free_val2)
 
-        if usdt_free is None:
+        if not usdt_free:
             usdt_free = 0.0
-        print(f"[{datetime.utcnow().isoformat()}] Available USDT balance (detected): {usdt_free:.2f} USDT", flush=True)
 
-        # If it’s still zero but you know you funded 10 USDT into futures, 
-        # likely CCXT’s data structure changed – check the printed 'info' above.
+        if usdt_free > 0:
+            bot_state["equity"] = usdt_free
+            print(f"[{datetime.utcnow().isoformat()}] Detected available USDT (used as equity): {usdt_free:.2f} USDT", flush=True)
+        else:
+            # No free USDT found → fall back to theoretical START_EQUITY
+            bot_state["equity"] = START_EQUITY
+            print(f"[{datetime.utcnow().isoformat()}] No free USDT detected. Falling back to START_EQUITY = {START_EQUITY:.2f}", flush=True)
+
     except Exception as e:
         print(f"[{datetime.utcnow().isoformat()}] ERROR fetching balance: {e}", flush=True)
+        # Fall back to theoretical equity so the bot can still run:
+        bot_state["equity"] = START_EQUITY
+        print(f"[{datetime.utcnow().isoformat()}] Falling back to START_EQUITY = {START_EQUITY:.2f}", flush=True)
 
 def fetch_initial_history():
     """
-    Fetch initial 5m and 15m candle history via REST to seed df5m and df15m.
+    Fetch the last ~100 5-minute candles and ~50 15-minute candles via CCXT REST.
+    This seeds df5m and df15m so indicator calculations can begin immediately.
     """
     global df5m, df15m
     try:
         exchange = get_ccxt_exchange()
 
-        # Fetch last 100 5m bars
+        # Last 100 x 5m bars
         ohlcv5 = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_5M, limit=100)
         df5 = pd.DataFrame(ohlcv5, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df5["timestamp"] = pd.to_datetime(df5["timestamp"], unit="ms", utc=True)
         df5m = df5[["timestamp", "open", "high", "low", "close", "volume"]]
 
-        # Fetch last 50 15m bars
+        # Last 50 x 15m bars
         ohlcv15 = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_15M, limit=50)
         df15 = pd.DataFrame(ohlcv15, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df15["timestamp"] = pd.to_datetime(df15["timestamp"], unit="ms", utc=True)
@@ -200,7 +228,7 @@ def fetch_initial_history():
 
 def fetch_daily_cache():
     """
-    Fetches 1-day candles via CCXT, computes daily pivot, and caches into df1d.
+    Fetch the last ~365 daily candles, compute the prior-day pivot, and store in df1d.
     """
     global df1d
     try:
@@ -220,7 +248,7 @@ def fetch_daily_cache():
 
 def resample_15m_from_5m():
     """
-    Resamples df5m into 15m, computes EMA50 on 15m, and updates df15m.
+    Resample df5m into 15-minute bars, compute EMA50 on 15m, and store in df15m.
     """
     global df5m, df15m
     with data_lock:
@@ -239,13 +267,15 @@ def resample_15m_from_5m():
 
 def calculate_indicators():
     """
-    Computes indicators for the latest 5m bar:
-    - EMA9, EMA21, EMA50
-    - RSI(14), ADX(14), ATR(14)
-    - VWAP (intraday), Bullish Engulfing
-    - EMA50_15 (from df15m)
-    - daily pivot (from df1d)
-    Returns a dict or None if insufficient data.
+    Compute all necessary indicators for the most recent 5m bar:
+    - EMA9, EMA21, EMA50 on 5m
+    - RSI(14), ADX(14), ATR(14) on 5m
+    - VWAP (intraday) on 5m
+    - Bullish Engulfing flag on 5m
+    - 15m EMA50 (forward‐filled)
+    - Daily pivot (from df1d)
+
+    Return a dict of indicators for the latest bar, or None if insufficient data.
     """
     global df5m, df15m, df1d
     with data_lock:
@@ -253,22 +283,23 @@ def calculate_indicators():
         df15 = df15m.copy()
         df1 = df1d.copy()
 
+    # Need at least 50 x 5m bars, 50 x 15m bars, and 2 x daily bars
     if len(df5) < 50 or len(df15) < 50 or len(df1) < 2:
         return None
 
-    # 5m EMAs
+    # 1) 5m EMAs
     df5["ema9"]  = df5["close"].ewm(span=9, adjust=False).mean()
     df5["ema21"] = df5["close"].ewm(span=21, adjust=False).mean()
     df5["ema50"] = df5["close"].ewm(span=50, adjust=False).mean()
 
-    # RSI(14)
+    # 2) RSI(14)
     delta = df5["close"].diff()
     gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss  = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     rs    = gain / loss
     df5["rsi"]  = 100 - (100 / (1 + rs))
 
-    # ADX(14)
+    # 3) ADX(14)
     high = df5["high"]
     low  = df5["low"]
     prev_close = df5["close"].shift(1)
@@ -289,40 +320,40 @@ def calculate_indicators():
     dx        = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))
     df5["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-    # ATR(14)
+    # 4) ATR(14)
     df5["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # VWAP (intraday)
+    # 5) VWAP (intraday)
     df5["date"] = df5["timestamp"].dt.floor("D")
     vwap_vals = []
     for d, grp in df5.groupby("date"):
-        tp = (grp["high"] + grp["low"] + grp["close"]) / 3
-        cum_vp  = (grp["volume"] * tp).cumsum()
-        cum_vol = grp["volume"].cumsum()
+        tp     = (grp["high"] + grp["low"] + grp["close"]) / 3
+        cum_vp = (grp["volume"] * tp).cumsum()
+        cum_vol= grp["volume"].cumsum()
         vwap_vals += list((cum_vp / cum_vol).fillna(method="ffill"))
     df5["vwap"] = vwap_vals
 
-    # Bullish Engulfing
-    op_prev   = df5["open"].shift(1)
-    cl_prev   = df5["close"].shift(1)
+    # 6) Bullish Engulfing
+    op_prev = df5["open"].shift(1)
+    cl_prev = df5["close"].shift(1)
     df5["bull_engulf"] = (op_prev > cl_prev) & (df5["open"] < cl_prev) & (df5["close"] > op_prev)
 
-    latest = df5.iloc[-1]
-    ts_latest = latest["timestamp"]
+    latest     = df5.iloc[-1]
+    ts_latest  = latest["timestamp"]
 
-    # 15m EMA50 (forward-filled)
+    # 7) 15m EMA50 (forward-filled)
     df15_idx = df15[df15["timestamp"] <= ts_latest]
     if df15_idx.empty:
         return None
     ema50_15_val = df15_idx.iloc[-1]["ema50_15"]
 
-    # Daily pivot
+    # 8) Daily pivot
     pivot_val = df1.loc[df1.index.date == ts_latest.date(), "pivot"].values
     pivot_val = float(pivot_val[0]) if len(pivot_val) > 0 else np.nan
 
-    # Debug: print indicators for every new 5m bar
+    # Debug: print out all indicators on each new 5m bar
     print(
-        f"[{ts_latest.isoformat()}] Indicators: "
+        f"[{ts_latest.isoformat()}] Indicators → "
         f"EMA9={latest['ema9']:.2f}, EMA21={latest['ema21']:.2f}, EMA50={latest['ema50']:.2f}, "
         f"ADX={latest['adx']:.2f}, RSI={latest['rsi']:.2f}, ATR={latest['atr']:.2f}, "
         f"VWAP={latest['vwap']:.2f}, EMA50_15={ema50_15_val:.2f}, Pivot={pivot_val:.2f}, "
@@ -348,8 +379,8 @@ def calculate_indicators():
 
 def calculate_entry_exit(ind):
     """
-    Given the latest indicators (dict), decide entry or exit.
-    Prints notification when entry conditions are checked and skipped.
+    Given the latest indicators, decide entry or exit.
+    - Prints which conditions failed if skipping entry.
     """
     global bot_state
     ts       = ind["timestamp"]
@@ -420,11 +451,11 @@ def calculate_entry_exit(ind):
 
     # ── ENTRY LOGIC ───────────────────────────────────────────────────────────────
     if not bot_state["in_position"]:
-        cond1 = (ema9 > ema21 > ema50)           # EMA stacking
+        cond1 = (ema9 > ema21 > ema50)           # EMA stacking on 5m
         cond2 = (adx > 20) and (rsi > 55)        # ADX + RSI momentum
         cond3 = (price > ema50_15)               # 15m EMA50 confirmation
         cond4 = (price > vwap)                   # VWAP filter
-        cond5 = (price > pivot)                  # daily pivot
+        cond5 = (price > pivot)                  # daily pivot filter
         cond6 = bull                            # bullish engulfing
         all_ok = all([cond1, cond2, cond3, cond4, cond5, cond6, atr > 0])
 
@@ -436,7 +467,7 @@ def calculate_entry_exit(ind):
             step_size   = exchange.markets[CCXT_SYMBOL]["limits"]["cost"]["min"]
             qty         = math.floor(raw_qty / step_size) * step_size
             if qty <= 0:
-                print(f"[{ts.isoformat()}] ⚠ Qty ≤ 0 (equity={equity:.2f}), skipping entry.", flush=True)
+                print(f"[{ts.isoformat()}] ⚠ Computed qty ≤ 0 (equity={equity:.2f}), skipping entry.", flush=True)
                 return
             exchange.create_order(CCXT_SYMBOL, "market", "buy", qty)
             print(f"[{ts.isoformat()}] ▶ Enter LONG. Bought {qty:.6f} BTC @ {entry_price:.2f}. TP={take_profit:.2f}", flush=True)
@@ -455,8 +486,7 @@ def calculate_entry_exit(ind):
             tstr = ts.isoformat()
             print(
                 f"[{tstr}] ❌ Entry conditions not met: "
-                f"cond1={cond1}, cond2={cond2}, cond3={cond3}, "
-                f"cond4={cond4}, cond5={cond5}, cond6={cond6} → skipping entry.",
+                f"cond1={cond1}, cond2={cond2}, cond3={cond3}, cond4={cond4}, cond5={cond5}, cond6={cond6} → skipping entry.",
                 flush=True
             )
             return
@@ -471,8 +501,8 @@ async def periodic_daily_refresh():
 
 def on_message(ws, message):
     """
-    Callback for incoming WebSocket messages.
-    Parses 5m candle events and updates df5m.
+    Called whenever a WebSocket message arrives. We parse any 5-minute candles,
+    update df5m, then resample to 15m & recalc indicators.
     """
     global df5m
     data = json.loads(message)
@@ -490,18 +520,22 @@ def on_message(ws, message):
                 "volume":    float(v)
             }
             with data_lock:
+                # Overwrite if the timestamp matches the last row, else append
                 if not df5m.empty and df5m.iloc[-1]["timestamp"] == ts:
                     df5m.iloc[-1] = entry
                 else:
                     df5m.loc[len(df5m)] = entry
 
-        # After updating 5m, resample to 15m, recalc indicators, attempt entry/exit
+        # Resample to 15m and attempt entry/exit
         resample_15m_from_5m()
         ind = calculate_indicators()
         if ind is not None:
             calculate_entry_exit(ind)
 
 def on_open(ws):
+    """
+    Called when WebSocket successfully opens. We now subscribe to 5m candles.
+    """
     sub_msg = {
         "op": "subscribe",
         "args": [
@@ -522,7 +556,9 @@ def on_close(ws, close_status_code, close_msg):
 
 def start_websocket():
     """
-    Starts the Bitget WebSocket in a loop. If connection is lost, wait 5s and reconnect.
+    Create and run the WebSocketApp. If the connection is lost,
+    wait 5s and then reconnect (in a loop).
+    We also specify ping_interval to keep the connection alive.
     """
     while True:
         try:
@@ -533,45 +569,45 @@ def start_websocket():
                 on_error=on_error,
                 on_close=on_close
             )
-            ws.run_forever()
+            # ping_interval=20s means send a ping frame every 20s to avoid timeouts
+            ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            print(f"[{datetime.utcnow().isoformat()}] WebSocket loop exception: {e}", flush=True)
+            print(f"[{datetime.utcnow().isoformat()}] WebSocket run_forever exception: {e}", flush=True)
         print(f"[{datetime.utcnow().isoformat()}] Reconnecting WebSocket in 5 seconds...", flush=True)
         time.sleep(5)
 
 async def heartbeat():
     """
-    Prints a heartbeat message every HEARTBEAT_INTERVAL_SECONDS to show the bot is alive.
+    Prints a simple heartbeat message every HEARTBEAT_INTERVAL_SECONDS so you know
+    the bot is still alive even if no candles/trades occur.
     """
     while True:
         print(f"[{datetime.utcnow().isoformat()}] 💓 Heartbeat: still running …", flush=True)
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 def main():
-    # (1) Print starting USDT balance (spot & futures)
+    # 1) Print starting balance (spot & futures raw info, then pick a value or fallback)
     print_initial_balance()
 
-    # (2) Fetch initial 5m and 15m history
+    # 2) Seed initial 5m/15m history via REST
     fetch_initial_history()
 
-    # (3) Spin up the health-check server on port 8000 (so Render sees an open port)
+    # 3) Spin up health-check server on port 8000
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    # (4) Fetch initial 1d cache
+    # 4) Fetch initial 1d cache
     fetch_daily_cache()
 
-    # (5) Schedule periodic 1d refresh every REFRESH_1D_HRS
+    # 5) Start asyncio tasks: periodic_daily_refresh() and heartbeat()
     loop = asyncio.get_event_loop()
     loop.create_task(periodic_daily_refresh())
-
-    # (6) Schedule heartbeat every HEARTBEAT_INTERVAL_SECONDS
     loop.create_task(heartbeat())
 
-    # (7) Start WebSocket thread (auto-reconnect inside)
+    # 6) Start WebSocket in its own thread (auto-reconnect logic inside)
     ws_thread = threading.Thread(target=start_websocket, daemon=True)
     ws_thread.start()
 
-    # (8) Keep main thread alive
+    # 7) Keep the main thread alive
     try:
         loop.run_forever()
     except KeyboardInterrupt:
