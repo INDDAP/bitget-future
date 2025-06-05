@@ -1,4 +1,4 @@
-ccxt
+python-binance
 pandas
 numpy
-websocket-client
+flask
