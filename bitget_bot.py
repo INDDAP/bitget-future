@@ -8,6 +8,7 @@ A live trading bot for BTCUSDT Perpetual Futures on Bitget.
 - Implements the “zero-loss, 0.5×ATR” strategy with multi-timeframe confirmation
 - Places orders via CCXT (Bitget futures)
 - Saves state to disk for persistence
+- Exposes a dummy HTTP port (8000) for health‐checks
 """
 
 import os
@@ -23,33 +24,43 @@ import numpy as np
 import ccxt
 import websocket  # pip install websocket-client
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 # ─── 1) CONFIGURATION ──────────────────────────────────────────────────────────
 
-API_KEY    = os.getenv("BITGET_API_KEY")
-API_SECRET = os.getenv("BITGET_API_SECRET")
-PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE")  # Bitget requires passphrase
+API_KEY     = os.getenv("BITGET_API_KEY")
+API_SECRET  = os.getenv("BITGET_API_SECRET")
+PASSPHRASE  = os.getenv("BITGET_API_PASSPHRASE")  # Bitget requires passphrase
 
 if not all([API_KEY, API_SECRET, PASSPHRASE]):
     raise ValueError("Please set BITGET_API_KEY, BITGET_API_SECRET, and BITGET_API_PASSPHRASE")
 
-WS_SYMBOL      = "BTCUSDT_UMCBL"  # for WebSocket subscription (Bitget format)
-CCXT_SYMBOL    = "BTCUSDT"        # for CCXT REST calls (Bitget futures)
-TIMEFRAME_5M   = "5m"
-TIMEFRAME_15M  = "15m"
-TIMEFRAME_1D   = "1d"
-STATE_FILE     = "bot_state.json"
-DATA_DIR       = "data_cache"     # directory to store cached CSVs
-TARGET_LEVERAGE = 100             # leverage
-START_EQUITY   = 1000.0           # initial equity (theoretical)
-MAX_BARS_HELD  = 10               # exit at breakeven after 10 bars
-ATR_MULTIPLIER = 0.5              # TP = entry_price + ATR*0.5
-REFRESH_1D_HRS = 1                # hourly refresh of 1d cache
+# Use these two distinct symbols:
+WS_SYMBOL    = "BTCUSDT_UMCBL"  # for WebSocket subscription (Bitget format)
+CCXT_SYMBOL  = "BTCUSDT"        # for CCXT REST calls (Bitget futures)
+
+TIMEFRAME_5M    = "5m"
+TIMEFRAME_15M   = "15m"
+TIMEFRAME_1D    = "1d"
+STATE_FILE      = "bot_state.json"
+DATA_DIR        = "data_cache"   # directory to store cached CSVs
+
+TARGET_LEVERAGE = 100            # leverage to use
+START_EQUITY    = 1000.0         # initial equity (purely theoretical for compounding)
+MAX_BARS_HELD   = 10             # exit at breakeven after this many 5m bars
+ATR_MULTIPLIER  = 0.5            # TP = entry_price + (ATR * ATR_MULTIPLIER)
+REFRESH_1D_HRS  = 1              # how often (in hours) to refresh 1d cache
 
 # WebSocket endpoint for Bitget mix (USDT-m futures)
 WS_URL = "wss://ws.bitgetapi.com/mix/v1/stream"
 
+# Health-check HTTP port
+HEALTH_PORT = 8000
+
+
 # ─── 2) GLOBAL STATE ────────────────────────────────────────────────────────────
 
+# Load or initialize bot_state (equity, in_position, etc.)
 if os.path.exists(STATE_FILE):
     with open(STATE_FILE, "r") as f:
         bot_state = json.load(f)
@@ -65,15 +76,39 @@ else:
         "entry_time": None
     }
 
-df5m  = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-df15m = pd.DataFrame(columns=["timestamp","open","high","low","close","volume","ema50_15"])
-df1d  = pd.DataFrame()  # daily cached
+# DataFrames holding candle data:
+df5m  = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+df15m = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "ema50_15"])
+df1d  = pd.DataFrame()  # will hold daily OHLCV + pivot
 
+# Lock to safely update DataFrames from WebSocket thread
 data_lock = threading.Lock()
 
-# ─── 3) UTILITY FUNCTIONS ───────────────────────────────────────────────────────
+
+# ─── 3) HTTP HEALTH‐CHECK SERVER ────────────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+def start_health_server():
+    """
+    Starts a minimal HTTP server on HEALTH_PORT that responds "OK" to any GET.
+    """
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+    print(f"Health-check server listening on port {HEALTH_PORT}")
+    server.serve_forever()
+
+
+# ─── 4) UTILITY FUNCTIONS ───────────────────────────────────────────────────────
 
 def save_state():
+    """
+    Persist bot_state to disk.
+    """
     with open(STATE_FILE, "w") as f:
         json.dump(bot_state, f, indent=2)
 
@@ -87,8 +122,8 @@ def get_ccxt_exchange():
         "password": PASSPHRASE,
         "enableRateLimit": True,
         "options": {
-            "defaultType": "future",
-            "defaultSubType": "UMCBL"
+            "defaultType": "future",   # we want futures
+            "defaultSubType": "UMCBL"  # USDT-m perpetual
         }
     })
     return exchange
@@ -100,22 +135,25 @@ def fetch_daily_cache():
     """
     global df1d
     exchange = get_ccxt_exchange()
-    # Fetch past 365 days of 1d data
-    since = exchange.parse8601((datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    # Fetch last 365 daily bars
+    since = exchange.parse8601(
+        (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
     ohlcv = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_1D, since=since, limit=365)
-    df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     df.set_index("timestamp", inplace=True)
-    # Compute prior-day pivot = (H_prev + L_prev + C_prev)/3
+    # Compute prior-day pivot = (H_prev + L_prev + C_prev) / 3
     df["pivot"] = (df["high"].shift(1) + df["low"].shift(1) + df["close"].shift(1)) / 3
-    df1d = df[["open","high","low","close","volume","pivot"]]
+    df1d = df[["open", "high", "low", "close", "volume", "pivot"]]
     os.makedirs(DATA_DIR, exist_ok=True)
     df1d.to_csv(f"{DATA_DIR}/BTCUSDT_1d_cache.csv")
+    print("Refreshed 1d cache")
 
 def resample_15m_from_5m():
     """
-    Resamples df5m (5-minute candles) into 15-minute candles,
-    calculates EMA50 on 15m, and stores into df15m.
+    Resample df5m (5-minute candles) into 15-minute candles, compute EMA50 on 15m,
+    and store resulting 15m DataFrame in df15m.
     """
     global df5m, df15m
     with data_lock:
@@ -129,13 +167,22 @@ def resample_15m_from_5m():
             "close": "last",
             "volume":"sum"
         }).dropna().reset_index()
+        # Compute EMA50 on 15m close price
         df15["ema50_15"] = df15["close"].ewm(span=50, adjust=False).mean()
         df15m = df15.copy()
 
 def calculate_indicators():
     """
-    Calculates all required indicators on the latest df5m.
-    Returns a dict of values for the latest candle.
+    Computes all indicators for the latest 5m bar:
+      - EMA9, EMA21, EMA50 (5m)
+      - RSI(14)
+      - ADX(14)
+      - ATR(14)
+      - VWAP (intraday)
+      - Bullish Engulfing (5m)
+      - EMA50_15 (from df15m, forward-filled)
+      - daily pivot (from df1d)
+    Returns a dict of indicator values for the latest bar, or None if insufficient data.
     """
     global df5m, df15m, df1d
     with data_lock:
@@ -143,22 +190,23 @@ def calculate_indicators():
         df15 = df15m.copy()
         df1 = df1d.copy()
 
+    # Need at least 50 bars of 5m, 50 bars of 15m, and 2 bars of 1d
     if len(df5) < 50 or len(df15) < 50 or len(df1) < 2:
         return None
 
-    # === 5m EMAs ===
+    # 5m EMAs
     df5["ema9"]  = df5["close"].ewm(span=9, adjust=False).mean()
-    df5["ema21"] = df5["close"].ewm(span=21,adjust=False).mean()
-    df5["ema50"] = df5["close"].ewm(span=50,adjust=False).mean()
+    df5["ema21"] = df5["close"].ewm(span=21, adjust=False).mean()
+    df5["ema50"] = df5["close"].ewm(span=50, adjust=False).mean()
 
-    # === RSI(14) ===
+    # RSI(14)
     delta = df5["close"].diff()
     gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss  = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     rs    = gain / loss
     df5["rsi"]  = 100 - (100 / (1 + rs))
 
-    # === ADX(14) ===
+    # ADX(14)
     high = df5["high"]
     low  = df5["low"]
     prev_close = df5["close"].shift(1)
@@ -177,12 +225,12 @@ def calculate_indicators():
     plus_di   = 100 * (plus_dm14 / tr14)
     minus_di  = 100 * (minus_dm14 / tr14)
     dx        = 100 * ( (plus_di - minus_di).abs() / (plus_di + minus_di) )
-    df5["adx"]= dx.ewm(alpha=1/14, adjust=False).mean()
+    df5["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
-    # === ATR(14) ===
+    # ATR(14)
     df5["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # === VWAP ===
+    # VWAP (intraday)
     df5["date"] = df5["timestamp"].dt.floor("D")
     vwap_vals = []
     for d, grp in df5.groupby("date"):
@@ -192,7 +240,7 @@ def calculate_indicators():
         vwap_vals += list((cum_vp / cum_vol).fillna(method="ffill"))
     df5["vwap"] = vwap_vals
 
-    # === Bullish Engulfing ===
+    # Bullish Engulfing pattern
     op_prev   = df5["open"].shift(1)
     cl_prev   = df5["close"].shift(1)
     df5["bull_engulf"] = (op_prev > cl_prev) & (df5["open"] < cl_prev) & (df5["close"] > op_prev)
@@ -200,13 +248,13 @@ def calculate_indicators():
     latest = df5.iloc[-1]
     ts_latest = latest["timestamp"]
 
-    # 15m EMA50 (forward-filled)
+    # 15m EMA50 (forward‐filled)
     df15_idx = df15[df15["timestamp"] <= ts_latest]
     if df15_idx.empty:
         return None
     ema50_15_val = df15_idx.iloc[-1]["ema50_15"]
 
-    # Daily pivot
+    # Daily pivot for that date
     pivot_val = df1.loc[df1.index.date == ts_latest.date(), "pivot"].values
     if len(pivot_val) == 0:
         pivot_val = np.nan
@@ -258,7 +306,7 @@ def calculate_entry_exit(ind):
         qty    = bot_state["quantity"]
         equity = bot_state["equity"]
 
-        # Check TP
+        # 1) Take-profit check
         if high >= tp:
             exchange.create_order(CCXT_SYMBOL, "market", "sell", qty)
             R       = (tp - ep) / ep
@@ -277,7 +325,7 @@ def calculate_entry_exit(ind):
             save_state()
             return
 
-        # Breakeven after MAX_BARS_HELD
+        # 2) Breakeven exit after MAX_BARS_HELD
         if bot_state["bars_held"] >= MAX_BARS_HELD:
             order = exchange.create_order(
                 CCXT_SYMBOL, "limit", "sell", qty, ep, {"timeInForce": "GTC"}
@@ -355,11 +403,11 @@ def on_message(ws, message):
             ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).replace(second=0, microsecond=0)
             entry = {
                 "timestamp": ts,
-                "open":       float(o),
-                "high":       float(h),
-                "low":        float(l),
-                "close":      float(c),
-                "volume":     float(v)
+                "open":      float(o),
+                "high":      float(h),
+                "low":       float(l),
+                "close":     float(c),
+                "volume":    float(v)
             }
             with data_lock:
                 if not df5m.empty and df5m.iloc[-1]["timestamp"] == ts:
@@ -367,6 +415,7 @@ def on_message(ws, message):
                 else:
                     df5m.loc[len(df5m)] = entry
 
+        # Resample 15m, recalc indicators, attempt entry/exit
         resample_15m_from_5m()
         ind = calculate_indicators()
         if ind is not None:
@@ -408,13 +457,21 @@ def start_websocket():
     ws.run_forever()
 
 def main():
+    # 1) Spin up the health‐check server on port 8000
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # 2) Initial fetch of 1d cache
     fetch_daily_cache()
+
+    # 3) Schedule periodic refresh of 1d candles
     loop = asyncio.get_event_loop()
     loop.create_task(periodic_daily_refresh())
 
-    wm_thread = threading.Thread(target=start_websocket, daemon=True)
-    wm_thread.start()
+    # 4) Start WebSocket thread for 5m candles
+    ws_thread = threading.Thread(target=start_websocket, daemon=True)
+    ws_thread.start()
 
+    # 5) Keep the main thread alive
     try:
         loop.run_forever()
     except KeyboardInterrupt:
