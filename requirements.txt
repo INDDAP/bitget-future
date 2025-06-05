@@ -1,4 +1,4 @@
-python-binance
+ccxt
 pandas
 numpy
 flask
