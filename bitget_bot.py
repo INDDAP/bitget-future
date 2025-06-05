@@ -12,6 +12,7 @@ A live trading bot for BTCUSDT Perpetual Futures on Bitget.
 - Shows available USDT balance at startup.
 - Saves state to disk for persistence.
 - Exposes a dummy HTTP port (8000) for health‐checks.
+- Prints a heartbeat every 5 minutes.
 """
 
 import os
@@ -57,6 +58,8 @@ REFRESH_1D_HRS  = 1
 WS_URL = "wss://ws.bitgetapi.com/mix/v1/stream"
 HEALTH_PORT = 8000
 
+HEARTBEAT_INTERVAL_SECONDS = 300  # 5 minutes
+
 
 # ─── 2) GLOBAL STATE ────────────────────────────────────────────────────────────
 
@@ -97,7 +100,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
-    print(f"Health-check server listening on port {HEALTH_PORT}")
+    print(f"[{datetime.utcnow().isoformat()}] Health-check server listening on port {HEALTH_PORT}", flush=True)
     server.serve_forever()
 
 
@@ -106,8 +109,12 @@ def start_health_server():
 def save_state():
     with open(STATE_FILE, "w") as f:
         json.dump(bot_state, f, indent=2)
+    print(f"[{datetime.utcnow().isoformat()}] State saved to disk.", flush=True)
 
 def get_ccxt_exchange():
+    """
+    Returns a CCXT instance configured for Bitget futures.
+    """
     exchange = ccxt.bitget({
         "apiKey": API_KEY,
         "secret": API_SECRET,
@@ -120,38 +127,67 @@ def get_ccxt_exchange():
     })
     return exchange
 
+def print_initial_balance():
+    """
+    Prints available USDT balance from the futures wallet at startup.
+    """
+    try:
+        exchange = get_ccxt_exchange()
+        balance = exchange.fetch_balance(params={"type": "future"})
+        usdt_free = balance.get("USDT", {}).get("free", None)
+        if usdt_free is None:
+            usdt_free = balance["total"].get("USDT", 0.0)
+        print(f"[{datetime.utcnow().isoformat()}] Available USDT balance (futures): {usdt_free:.2f} USDT", flush=True)
+    except Exception as e:
+        print(f"[{datetime.utcnow().isoformat()}] ERROR fetching balance: {e}", flush=True)
+
 def fetch_initial_history():
+    """
+    Fetch initial 5m and 15m candle history via REST to seed df5m and df15m.
+    """
     global df5m, df15m
-    exchange = get_ccxt_exchange()
+    try:
+        exchange = get_ccxt_exchange()
 
-    ohlcv5 = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_5M, limit=100)
-    df5 = pd.DataFrame(ohlcv5, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df5["timestamp"] = pd.to_datetime(df5["timestamp"], unit="ms", utc=True)
-    df5m = df5[["timestamp", "open", "high", "low", "close", "volume"]]
+        ohlcv5 = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_5M, limit=100)
+        df5 = pd.DataFrame(ohlcv5, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df5["timestamp"] = pd.to_datetime(df5["timestamp"], unit="ms", utc=True)
+        df5m = df5[["timestamp", "open", "high", "low", "close", "volume"]]
 
-    ohlcv15 = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_15M, limit=50)
-    df15 = pd.DataFrame(ohlcv15, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df15["timestamp"] = pd.to_datetime(df15["timestamp"], unit="ms", utc=True)
-    df15["ema50_15"] = df15["close"].ewm(span=50, adjust=False).mean()
-    df15m = df15[["timestamp", "open", "high", "low", "close", "volume", "ema50_15"]]
+        ohlcv15 = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_15M, limit=50)
+        df15 = pd.DataFrame(ohlcv15, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df15["timestamp"] = pd.to_datetime(df15["timestamp"], unit="ms", utc=True)
+        df15["ema50_15"] = df15["close"].ewm(span=50, adjust=False).mean()
+        df15m = df15[["timestamp", "open", "high", "low", "close", "volume", "ema50_15"]]
 
-    print("Fetched initial 5m and 15m history")
+        print(f"[{datetime.utcnow().isoformat()}] Fetched initial 5m and 15m history", flush=True)
+    except Exception as e:
+        print(f"[{datetime.utcnow().isoformat()}] ERROR fetching initial history: {e}", flush=True)
 
 def fetch_daily_cache():
+    """
+    Fetches 1-day candles via CCXT and caches into df1d.
+    """
     global df1d
-    exchange = get_ccxt_exchange()
-    since = exchange.parse8601((datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    ohlcv = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_1D, since=since, limit=365)
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df.set_index("timestamp", inplace=True)
-    df["pivot"] = (df["high"].shift(1) + df["low"].shift(1) + df["close"].shift(1)) / 3
-    df1d = df[["open", "high", "low", "close", "volume", "pivot"]]
-    os.makedirs(DATA_DIR, exist_ok=True)
-    df1d.to_csv(f"{DATA_DIR}/BTCUSDT_1d_cache.csv")
-    print("Refreshed 1d cache")
+    try:
+        exchange = get_ccxt_exchange()
+        since = exchange.parse8601((datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        ohlcv = exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=TIMEFRAME_1D, since=since, limit=365)
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df.set_index("timestamp", inplace=True)
+        df["pivot"] = (df["high"].shift(1) + df["low"].shift(1) + df["close"].shift(1)) / 3
+        df1d = df[["open", "high", "low", "close", "volume", "pivot"]]
+        os.makedirs(DATA_DIR, exist_ok=True)
+        df1d.to_csv(f"{DATA_DIR}/BTCUSDT_1d_cache.csv")
+        print(f"[{datetime.utcnow().isoformat()}] Refreshed 1d cache", flush=True)
+    except Exception as e:
+        print(f"[{datetime.utcnow().isoformat()}] ERROR fetching daily cache: {e}", flush=True)
 
 def resample_15m_from_5m():
+    """
+    Resamples df5m into 15m, computes EMA50 on 15m, and updates df15m.
+    """
     global df5m, df15m
     with data_lock:
         if df5m.empty:
@@ -168,6 +204,15 @@ def resample_15m_from_5m():
         df15m = df15[["timestamp", "open", "high", "low", "close", "volume", "ema50_15"]]
 
 def calculate_indicators():
+    """
+    Computes indicators for the latest 5m bar:
+    - EMA9, EMA21, EMA50
+    - RSI(14), ADX(14), ATR(14)
+    - VWAP (intraday), Bullish Engulfing
+    - EMA50_15 (from df15m)
+    - daily pivot (from df1d)
+    Returns a dict or None if insufficient data.
+    """
     global df5m, df15m, df1d
     with data_lock:
         df5 = df5m.copy()
@@ -177,16 +222,19 @@ def calculate_indicators():
     if len(df5) < 50 or len(df15) < 50 or len(df1) < 2:
         return None
 
+    # 5m EMAs
     df5["ema9"]  = df5["close"].ewm(span=9, adjust=False).mean()
     df5["ema21"] = df5["close"].ewm(span=21, adjust=False).mean()
     df5["ema50"] = df5["close"].ewm(span=50, adjust=False).mean()
 
+    # RSI(14)
     delta = df5["close"].diff()
     gain  = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss  = (-delta).clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     rs    = gain / loss
     df5["rsi"]  = 100 - (100 / (1 + rs))
 
+    # ADX(14)
     high = df5["high"]
     low  = df5["low"]
     prev_close = df5["close"].shift(1)
@@ -207,8 +255,10 @@ def calculate_indicators():
     dx        = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di))
     df5["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
 
+    # ATR(14)
     df5["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
+    # VWAP (intraday)
     df5["date"] = df5["timestamp"].dt.floor("D")
     vwap_vals = []
     for d, grp in df5.groupby("date"):
@@ -218,6 +268,7 @@ def calculate_indicators():
         vwap_vals += list((cum_vp / cum_vol).fillna(method="ffill"))
     df5["vwap"] = vwap_vals
 
+    # Bullish Engulfing
     op_prev   = df5["open"].shift(1)
     cl_prev   = df5["close"].shift(1)
     df5["bull_engulf"] = (op_prev > cl_prev) & (df5["open"] < cl_prev) & (df5["close"] > op_prev)
@@ -225,13 +276,22 @@ def calculate_indicators():
     latest = df5.iloc[-1]
     ts_latest = latest["timestamp"]
 
+    # 15m EMA50 (forward-filled)
     df15_idx = df15[df15["timestamp"] <= ts_latest]
     if df15_idx.empty:
         return None
     ema50_15_val = df15_idx.iloc[-1]["ema50_15"]
 
+    # Daily pivot
     pivot_val = df1.loc[df1.index.date == ts_latest.date(), "pivot"].values
     pivot_val = float(pivot_val[0]) if len(pivot_val) > 0 else np.nan
+
+    # Print a quick debug for every new indicator calculation
+    print(f"[{ts_latest.isoformat()}] Indicators: "
+          f"EMA9={latest['ema9']:.2f}, EMA21={latest['ema21']:.2f}, EMA50={latest['ema50']:.2f}, "
+          f"ADX={latest['adx']:.2f}, RSI={latest['rsi']:.2f}, ATR={latest['atr']:.2f}, "
+          f"VWAP={latest['vwap']:.2f}, EMA50_15={ema50_15_val:.2f}, Pivot={pivot_val:.2f}, "
+          f"Engulf={bool(latest['bull_engulf'])}", flush=True)
 
     return {
         "timestamp":    ts_latest,
@@ -267,6 +327,7 @@ def calculate_entry_exit(ind):
 
     exchange = get_ccxt_exchange()
 
+    # ── EXIT LOGIC ───────────────────────────────────────────────────────────────
     if bot_state["in_position"]:
         bot_state["bars_held"] += 1
         ep     = bot_state["entry_price"]
@@ -279,7 +340,7 @@ def calculate_entry_exit(ind):
             R       = (tp - ep) / ep
             pnl     = equity * (TARGET_LEVERAGE * R)
             bot_state["equity"] = equity + pnl
-            print(f"[{ts}] ▶ TP hit. Sold {qty:.6f} BTC @ {tp:.2f}. P/L = {pnl:.2f} USDT.")
+            print(f"[{ts.isoformat()}] ▶ TP hit. Sold {qty:.6f} BTC @ {tp:.2f}. P/L = {pnl:.2f} USDT.", flush=True)
             bot_state.update({
                 "in_position":   False,
                 "entry_price":   None,
@@ -301,7 +362,7 @@ def calculate_entry_exit(ind):
             if status["status"] != "closed":
                 exchange.cancel_order(order["id"], CCXT_SYMBOL)
                 exchange.create_order(CCXT_SYMBOL, "market", "sell", qty)
-            print(f"[{ts}] ▶ Breakeven exit. Sold {qty:.6f} BTC @ {ep:.2f}. P/L = 0.")
+            print(f"[{ts.isoformat()}] ▶ Breakeven exit. Sold {qty:.6f} BTC @ {ep:.2f}. P/L = 0.", flush=True)
             bot_state.update({
                 "in_position":   False,
                 "entry_price":   None,
@@ -314,6 +375,7 @@ def calculate_entry_exit(ind):
             save_state()
             return
 
+    # ── ENTRY LOGIC ───────────────────────────────────────────────────────────────
     if not bot_state["in_position"]:
         cond1 = (ema9 > ema21 > ema50)
         cond2 = (adx > 20) and (rsi > 55)
@@ -331,10 +393,10 @@ def calculate_entry_exit(ind):
             step_size   = exchange.markets[CCXT_SYMBOL]["limits"]["cost"]["min"]
             qty         = math.floor(raw_qty / step_size) * step_size
             if qty <= 0:
-                print(f"[{ts}] ⚠ Qty ≤ 0 (equity={equity:.2f}), skipping entry.")
+                print(f"[{ts.isoformat()}] ⚠ Qty ≤ 0 (equity={equity:.2f}), skipping entry.", flush=True)
                 return
             exchange.create_order(CCXT_SYMBOL, "market", "buy", qty)
-            print(f"[{ts}] ▶ Enter LONG. Bought {qty:.6f} BTC @ {entry_price:.2f}. TP={take_profit:.2f}")
+            print(f"[{ts.isoformat()}] ▶ Enter LONG. Bought {qty:.6f} BTC @ {entry_price:.2f}. TP={take_profit:.2f}", flush=True)
             bot_state.update({
                 "in_position":   True,
                 "entry_price":   entry_price,
@@ -351,11 +413,15 @@ def calculate_entry_exit(ind):
             print(
                 f"[{tstr}] ❌ Entry conditions not met: "
                 f"cond1={cond1}, cond2={cond2}, cond3={cond3}, "
-                f"cond4={cond4}, cond5={cond5}, cond6={cond6} → skipping entry."
+                f"cond4={cond4}, cond5={cond5}, cond6={cond6} → skipping entry.",
+                flush=True
             )
             return
 
 async def periodic_daily_refresh():
+    """
+    Periodically refresh the 1-day cache every REFRESH_1D_HRS hours.
+    """
     while True:
         fetch_daily_cache()
         await asyncio.sleep(3600 * REFRESH_1D_HRS)
@@ -382,6 +448,7 @@ def on_message(ws, message):
                 else:
                     df5m.loc[len(df5m)] = entry
 
+        # After updating 5m, resample into 15m, recalc indicators, attempt entry/exit
         resample_15m_from_5m()
         ind = calculate_indicators()
         if ind is not None:
@@ -398,13 +465,13 @@ def on_open(ws):
         ]
     }
     ws.send(json.dumps(sub_msg))
-    print("WebSocket connected and subscribed to 5m candles.")
+    print(f"[{datetime.utcnow().isoformat()}] WebSocket connected and subscribed to 5m candles.", flush=True)
 
 def on_error(ws, error):
-    print("WebSocket error:", error)
+    print(f"[{datetime.utcnow().isoformat()}] WebSocket error: {error}", flush=True)
 
 def on_close(ws, close_status_code, close_msg):
-    print("WebSocket closed:", close_status_code, close_msg)
+    print(f"[{datetime.utcnow().isoformat()}] WebSocket closed: {close_status_code} {close_msg}", flush=True)
 
 def start_websocket():
     ws = websocket.WebSocketApp(
@@ -416,27 +483,43 @@ def start_websocket():
     )
     ws.run_forever()
 
-def print_initial_balance():
-    exchange = get_ccxt_exchange()
-    balance = exchange.fetch_balance(params={"type": "future"})
-    usdt_free = balance.get("USDT", {}).get("free", None)
-    if usdt_free is None:
-        usdt_free = balance["total"].get("USDT", 0.0)
-    print(f"Available USDT balance (futures): {usdt_free:.2f} USDT")
+async def heartbeat():
+    """
+    Prints a heartbeat message every HEARTBEAT_INTERVAL_SECONDS.
+    """
+    while True:
+        print(f"[{datetime.utcnow().isoformat()}] 💓 Heartbeat: still running...", flush=True)
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 def main():
+    # 1) Print starting balance
     print_initial_balance()
+
+    # 2) Fetch initial 5m/15m history
     fetch_initial_history()
+
+    # 3) Start health-check server on port 8000
     threading.Thread(target=start_health_server, daemon=True).start()
+
+    # 4) Fetch initial 1d cache
     fetch_daily_cache()
+
+    # 5) Schedule periodic refresh of 1d candles
     loop = asyncio.get_event_loop()
     loop.create_task(periodic_daily_refresh())
+
+    # 6) Schedule heartbeat every 5 minutes
+    loop.create_task(heartbeat())
+
+    # 7) Start WebSocket thread for 5m candles
     ws_thread = threading.Thread(target=start_websocket, daemon=True)
     ws_thread.start()
+
+    # 8) Keep main thread alive
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        print("Shutting down bot...")
+        print(f"[{datetime.utcnow().isoformat()}] Shutting down bot...", flush=True)
 
 if __name__ == "__main__":
     main()
